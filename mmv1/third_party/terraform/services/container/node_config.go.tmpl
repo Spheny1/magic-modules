@@ -1,10 +1,13 @@
 package container
 
 import (
+	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-cty/cty"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 
@@ -74,6 +77,21 @@ func schemaContainerdConfig() *schema.Schema {
 						}},
 					},
 				}},
+			},
+			"writable_cgroups": {
+				Type:        schema.TypeList,
+				Description: `Parameters for writable cgroups configuration.`,
+				Optional:    true,
+				MaxItems:    1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"enabled": {
+							Type:        schema.TypeBool,
+							Required:    true,
+							Description: `Whether writable cgroups are enabled.`,
+						},
+					},
+				},
 			},
 		}},
 	}
@@ -659,6 +677,7 @@ func schemaNodeConfig() *schema.Schema {
 							},
 							"cpu_cfs_quota": {
 								Type:     schema.TypeBool,
+								Computed: true,
 								Optional: true,
 								Description: `Enable CPU CFS quota enforcement for containers that specify CPU limits.`,
 							},
@@ -1213,7 +1232,7 @@ func expandNodeConfigDefaults(configured interface{}) *container.NodeConfigDefau
 	return nodeConfigDefaults
 }
 
-func expandNodeConfig(v interface{}) *container.NodeConfig {
+func expandNodeConfig(d *schema.ResourceData, prefix string, v interface{}) *container.NodeConfig {
 	nodeConfigs := v.([]interface{})
 	nc := &container.NodeConfig{
 		// Defaults can't be set on a list/set in the schema, so set the default on create here.
@@ -1496,6 +1515,34 @@ func expandNodeConfig(v interface{}) *container.NodeConfig {
 
 	if v, ok := nodeConfig["kubelet_config"]; ok {
 		nc.KubeletConfig = expandKubeletConfig(v)
+
+		// start cpu_cfs_quota fix https://github.com/hashicorp/terraform-provider-google/issues/15767
+		// this makes the field conditional on appearance in configuration. This allows the API `true` default
+		// to override null, where currently we force-send null as false, which is wrong.
+		rawConfigNPRoot := d.GetRawConfig()
+		// if we have a prefix, we're in `node_pool.N.` in GKE Cluster. Traverse the RawConfig object to reach that
+		// root, at which point local references work going forwards.
+		if prefix != "" {
+			parts := strings.Split(prefix, ".") // "node_pool.N." -> ["node_pool" "N", ""]
+			npIndex, err := strconv.Atoi(parts[1])
+			if err != nil { // no error return from expander
+			    panic(fmt.Errorf("unexpected format for node pool path prefix: %w. value: %v", err, prefix))
+			}
+
+			rawConfigNPRoot = rawConfigNPRoot.GetAttr("node_pool").Index(cty.NumberIntVal(int64(npIndex)))
+		}
+
+		if vNC := rawConfigNPRoot.GetAttr("node_config"); vNC.LengthInt() > 0 {
+			if vKC := vNC.Index(cty.NumberIntVal(0)).GetAttr("kubelet_config"); vKC.LengthInt() > 0 {
+				v := vKC.Index(cty.NumberIntVal(0)).GetAttr("cpu_cfs_quota");
+				if v == cty.NullVal(cty.Bool) {
+				    nc.KubeletConfig.CpuCfsQuota = true
+				} else if v.False() { // force-send explicit false to API
+					nc.KubeletConfig.ForceSendFields = append(nc.KubeletConfig.ForceSendFields, "CpuCfsQuota")
+				}
+			}
+		}
+		// end cpu_cfs_quota fix
 	}
 
 	if v, ok := nodeConfig["linux_node_config"]; ok {
@@ -1640,7 +1687,6 @@ func expandKubeletConfig(v interface{}) *container.NodeKubeletConfig {
 	}
 	if cpuCfsQuota, ok := cfg["cpu_cfs_quota"]; ok {
 		kConfig.CpuCfsQuota = cpuCfsQuota.(bool)
-		kConfig.ForceSendFields = append(kConfig.ForceSendFields, "CpuCfsQuota")
 	}
 	if cpuCfsQuotaPeriod, ok := cfg["cpu_cfs_quota_period"]; ok {
 		kConfig.CpuCfsQuotaPeriod = cpuCfsQuotaPeriod.(string)
@@ -1931,6 +1977,7 @@ func expandContainerdConfig(v interface{}) *container.ContainerdConfig {
 
 	cc := &container.ContainerdConfig{}
 	cc.PrivateRegistryAccessConfig = expandPrivateRegistryAccessConfig(cfg["private_registry_access_config"])
+	cc.WritableCgroups = expandWritableCgroups(cfg["writable_cgroups"])
 	return cc
 }
 
@@ -2000,6 +2047,26 @@ func expandGCPSecretManagerCertificateConfig(v interface{}) *container.GCPSecret
 		gcpSMConfig.SecretUri = v.(string)
 	}
 	return gcpSMConfig
+}
+
+func expandWritableCgroups(v interface{}) *container.WritableCgroups {
+	if v == nil {
+		return nil
+	}
+	ls := v.([]interface{})
+	if len(ls) == 0 {
+		return nil
+	}
+	if ls[0] == nil {
+		return &container.WritableCgroups{}
+	}
+	cfg := ls[0].(map[string]interface{})
+
+	wcg := &container.WritableCgroups{}
+	if enabled, ok := cfg["enabled"]; ok {
+		wcg.Enabled = enabled.(bool)
+	}
+	return wcg
 }
 
 func expandSoleTenantConfig(v interface{}) *container.SoleTenantConfig {
@@ -2605,6 +2672,9 @@ func flattenContainerdConfig(c *container.ContainerdConfig) []map[string]interfa
 	if c.PrivateRegistryAccessConfig != nil {
 		r["private_registry_access_config"] = flattenPrivateRegistryAccessConfig(c.PrivateRegistryAccessConfig)
 	}
+	if c.WritableCgroups != nil {
+		r["writable_cgroups"] = flattenWritableCgroups(c.WritableCgroups)
+	}
 	return append(result, r)
 }
 
@@ -2660,6 +2730,17 @@ func flattenGCPSecretManagerCertificateConfig(c *container.GCPSecretManagerCerti
 	}
 	r := map[string]interface{}{
 		"secret_uri": c.SecretUri,
+	}
+	return append(result, r)
+}
+
+func flattenWritableCgroups(c *container.WritableCgroups) []map[string]interface{} {
+	result := []map[string]interface{}{}
+	if c == nil {
+		return result
+	}
+	r := map[string]interface{}{
+		"enabled": c.Enabled,
 	}
 	return append(result, r)
 }
